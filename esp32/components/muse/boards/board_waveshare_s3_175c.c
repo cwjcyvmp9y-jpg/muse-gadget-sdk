@@ -25,17 +25,25 @@
  * and MCLK to 42. GPIO 1 to 3 go to its SD slot, so PWR is read from the PMU's
  * key latch, and BOOT talks: held long, PWR makes the PMU cut power.
  */
+#include <math.h>
+#include <stdio.h>
+
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/touch.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "muse_audio.h"
 #include "muse_board.h"
 #include "muse_lcd_bands.h"
 #include "muse_mem.h"
@@ -83,9 +91,16 @@ static esp_err_t init(void)
      * left (a 16 s shutdown cleared then stays off, the datasheet default). */
     (void)muse_pmu_set_key_shutdown(true);   /* logs if it can't */
 #endif
-    /* Only DCDC1 (VCC3V3) and ALDO1 (A3V3, for the codecs) feed anything; the
-     * schematic leaves the rest unconnected. Waveshare's AXP2101 example and
-     * xiaozhi's board turn them off too. */
+    /* Only DCDC1 (VCC3V3, including the NS4150B amp) and ALDO1 (A3V3, the
+     * codecs' analog supply) feed anything; the schematic leaves the rest
+     * unconnected. xiaozhi and Waveshare's AXP2101 example set both to 3.3 V
+     * and then turn the others off. keep_rails() only clears enables, so a
+     * PMU that left ALDO1 off (or at its default voltage) stays that way and
+     * the DAC has no analog supply. */
+    err = muse_pmu_set_dcdc1_aldo1_3v3();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "codec rails not at 3.3 V (%s)", esp_err_to_name(err));
+    }
     err = muse_pmu_keep_rails(BIT(0), BIT(0));
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "unused rails left on (%s)", esp_err_to_name(err));
@@ -209,11 +224,332 @@ static void display_pause(bool pause)
     }
 }
 
+/* NS4150B CTRL is GPIO46, active high (Waveshare's ES8311 sketch and
+ * xiaozhi's AUDIO_CODEC_PA_PIN, pa_reverted false). INPUT_OUTPUT so the
+ * read-back is the pad, not the unread output latch. */
+static bool s_pa_reset;
+
+static void pa_drive(bool high, const char *when)
+{
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BSP_POWER_AMP_IO,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_hold_dis(BSP_POWER_AMP_IO);
+    if (!s_pa_reset) {
+        gpio_reset_pin(BSP_POWER_AMP_IO);
+        s_pa_reset = true;
+    }
+    gpio_config(&io);
+    gpio_sleep_sel_dis(BSP_POWER_AMP_IO);
+    int before = gpio_get_level(BSP_POWER_AMP_IO);
+    gpio_set_level(BSP_POWER_AMP_IO, high ? 1 : 0);
+    int after = gpio_get_level(BSP_POWER_AMP_IO);
+    ESP_LOGI(TAG, "PA enable GPIO%d %s %s (before %d, read %d)", (int)BSP_POWER_AMP_IO, when,
+             high ? "high" : "low", before, after);
+}
+
+static void audio_power(bool on)
+{
+    pa_drive(on, on ? "on" : "off");
+}
+
+/* esp_codec_dev_open() rewrites a full-duplex port to 16-bit slots (32 BCLK
+ * per frame). The ES8311 coefficient for 16 kHz and MCLK x256 programs a
+ * BCLK divider of 4, which is 64 BCLK per frame: 16-bit samples in 32-bit
+ * slots, the format xiaozhi's BoxAudioCodec settles on once its ES7210 TDM
+ * RX shares the clock. Muse writes both slots with the same sample, so the
+ * mask stays both rather than xiaozhi's mono left. */
+typedef struct {
+    audio_codec_data_if_t base;
+    const audio_codec_data_if_t *inner;
+    i2s_chan_handle_t tx;
+    i2s_chan_handle_t rx;
+    bool tx_on;
+    bool rx_on;
+} wide_slot_t;
+
+static wide_slot_t s_i2s;
+
+static void force_wide_slots(void)
+{
+    i2s_channel_disable(s_i2s.tx);
+    i2s_channel_disable(s_i2s.rx);
+    i2s_std_slot_config_t slot = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                                     I2S_SLOT_MODE_STEREO);
+    slot.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
+    slot.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    slot.ws_width = 32;
+    slot.slot_mask = I2S_STD_SLOT_BOTH;
+    esp_err_t tx = i2s_channel_reconfig_std_slot(s_i2s.tx, &slot);
+    esp_err_t rx = i2s_channel_reconfig_std_slot(s_i2s.rx, &slot);
+    if (tx != ESP_OK || rx != ESP_OK) {
+        ESP_LOGW(TAG, "I2S 16-in-32 slots: tx %s rx %s", esp_err_to_name(tx), esp_err_to_name(rx));
+    }
+}
+
+static int slot_set_fmt(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, esp_codec_dev_sample_info_t *fs)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->set_fmt(s->inner, type, fs);
+}
+
+static int slot_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
+{
+    wide_slot_t *s = (wide_slot_t *)h;
+    if (on) {
+        /* set_fmt just left 16-bit slots. Widen before the enable, and put
+         * back a direction that was already running (the mic opens second). */
+        force_wide_slots();
+    }
+    int ret = s->inner->enable(s->inner, type, on);
+    if (type & ESP_CODEC_DEV_TYPE_OUT) {
+        s->tx_on = on;
+    }
+    if (type & ESP_CODEC_DEV_TYPE_IN) {
+        s->rx_on = on;
+    }
+    if (on && s->tx_on && !(type & ESP_CODEC_DEV_TYPE_OUT)) {
+        i2s_channel_enable(s->tx);
+    }
+    if (on && s->rx_on && !(type & ESP_CODEC_DEV_TYPE_IN)) {
+        i2s_channel_enable(s->rx);
+    }
+    if (on) {
+        ESP_LOGI(TAG, "I2S slots 16-bit data in 32-bit frames");
+    }
+    return ret;
+}
+
+static int slot_open(const audio_codec_data_if_t *h, void *cfg, int size)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->open(s->inner, cfg, size);
+}
+
+static bool slot_is_open(const audio_codec_data_if_t *h)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->is_open(s->inner);
+}
+
+static int slot_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->read(s->inner, data, size);
+}
+
+static int slot_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->write(s->inner, data, size);
+}
+
+static int slot_close(const audio_codec_data_if_t *h)
+{
+    const wide_slot_t *s = (const wide_slot_t *)h;
+    return s->inner->close(s->inner);
+}
+
+static esp_codec_dev_handle_t s_out;
+
+static void dump_es8311(esp_codec_dev_handle_t spk, const char *when)
+{
+    char line[180];
+    int n = snprintf(line, sizeof(line), "ES8311 %s 00-45:", when);
+    for (int reg = 0; reg <= 0x45 && n < (int)sizeof(line) - 3; reg++) {
+        int val = 0;
+        if (esp_codec_dev_read_reg(spk, reg, &val) != ESP_CODEC_DEV_OK) {
+            n += snprintf(line + n, sizeof(line) - n, "??");
+        } else {
+            n += snprintf(line + n, sizeof(line) - n, "%02x", val & 0xff);
+        }
+    }
+    ESP_LOGI(TAG, "%s", line);
+    int fd = -1, fe = -1, ff = -1;
+    esp_codec_dev_read_reg(spk, 0xFD, &fd);
+    esp_codec_dev_read_reg(spk, 0xFE, &fe);
+    esp_codec_dev_read_reg(spk, 0xFF, &ff);
+    ESP_LOGI(TAG, "ES8311 id FD=%02x FE=%02x FF=%02x", fd & 0xff, fe & 0xff, ff & 0xff);
+}
+
+/* The registers xiaozhi's ES8311 enable leaves for a slave, MCLK-fed DAC:
+ * clock on, 16-bit I2S, analog and DAC and HP drive up, unmute, volume. */
+static void es8311_fix(esp_codec_dev_handle_t spk)
+{
+    int mute = 0;
+    esp_codec_dev_read_reg(spk, 0x31, &mute);
+    esp_codec_dev_write_reg(spk, 0x00, 0x80);
+    esp_codec_dev_write_reg(spk, 0x01, 0x3F);
+    esp_codec_dev_write_reg(spk, 0x09, 0x0C);
+    esp_codec_dev_write_reg(spk, 0x0D, 0x01);
+    esp_codec_dev_write_reg(spk, 0x12, 0x00);
+    esp_codec_dev_write_reg(spk, 0x13, 0x10);
+    esp_codec_dev_write_reg(spk, 0x31, mute & ~0x60);
+    esp_codec_dev_write_reg(spk, 0x32, 0xC0);
+    esp_codec_dev_write_reg(spk, 0x37, 0x08);
+    int r00 = 0, r01 = 0, r09 = 0, r0d = 0, r12 = 0, r13 = 0, r31 = 0, r32 = 0, r37 = 0;
+    esp_codec_dev_read_reg(spk, 0x00, &r00);
+    esp_codec_dev_read_reg(spk, 0x01, &r01);
+    esp_codec_dev_read_reg(spk, 0x09, &r09);
+    esp_codec_dev_read_reg(spk, 0x0D, &r0d);
+    esp_codec_dev_read_reg(spk, 0x12, &r12);
+    esp_codec_dev_read_reg(spk, 0x13, &r13);
+    esp_codec_dev_read_reg(spk, 0x31, &r31);
+    esp_codec_dev_read_reg(spk, 0x32, &r32);
+    esp_codec_dev_read_reg(spk, 0x37, &r37);
+    ESP_LOGI(TAG, "ES8311 now 00=%02x 01=%02x 09=%02x 0d=%02x 12=%02x 13=%02x 31=%02x 32=%02x 37=%02x",
+             r00 & 0xff, r01 & 0xff, r09 & 0xff, r0d & 0xff, r12 & 0xff, r13 & 0xff, r31 & 0xff, r32 & 0xff,
+             r37 & 0xff);
+}
+
+static void speaker_probe(esp_codec_dev_handle_t spk, const char *when)
+{
+    pa_drive(true, when);
+    if (spk) {
+        dump_es8311(spk, when);
+        es8311_fix(spk);
+    }
+}
+
+static void boot_tone(void)
+{
+    enum { N = 64 };
+    int16_t buf[N * 2];
+    ESP_LOGI(TAG, "test tone start");
+    speaker_probe(s_out, "tone");
+    for (int n = 0; n < MUSE_AUDIO_RATE; n += N) {
+        for (int i = 0; i < N; i++) {
+            float ph = 2.0f * 3.14159265f * 1000.0f * (float)(n + i) / (float)MUSE_AUDIO_RATE;
+            int16_t s = (int16_t)(sinf(ph) * 12000.0f);
+            buf[2 * i] = buf[2 * i + 1] = s;
+        }
+        esp_codec_dev_write(s_out, buf, sizeof(buf));
+    }
+    ESP_LOGI(TAG, "test tone end");
+}
+
+static esp_err_t es8311_reset(void)
+{
+    /* Same 0x1F hold as Es8311AudioCodec::ResetCodec, before the codec
+     * driver owns 7-bit address 0x18. */
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = 0x18,
+        .scl_speed_hz = 400000,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    esp_err_t err = i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &dev);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t buf[2] = { 0x00, 0x1F };
+    err = i2c_master_transmit(dev, buf, sizeof(buf), 50);
+    i2c_master_bus_rm_device(dev);
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        ESP_LOGI(TAG, "ES8311 reset 00=1f");
+    }
+    return err;
+}
+
 static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
 {
-    *spk = bsp_audio_codec_speaker_init();
-    *mic = bsp_audio_codec_microphone_init();
-    return *spk && *mic ? ESP_OK : ESP_FAIL;
+    /* Own the bus instead of bsp_audio_codec_speaker_init(): that leaves the
+     * port mono at 22050 Hz, and a later open cannot widen the slots while
+     * the other direction is running. Pins are the BSP's (1.75C MCLK 16, the
+     * 1.75 MCLK 42; BCLK 9, WS 45, DOUT 8, DIN 10). ES8311 is slave, DAC
+     * only, MCLK on, pa_pin 46, hw_gain 5.0/3.3, as BoxAudioCodec on
+     * xiaozhi's 1.75(C). The ES7210 stays on the same clocks. */
+    i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM, I2S_ROLE_MASTER);
+    chan.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan, &s_i2s.tx, &s_i2s.rx), TAG, "i2s chan");
+    i2s_std_config_t std = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S_MCLK,
+            .bclk = BSP_I2S_SCLK,
+            .ws = BSP_I2S_LCLK,
+            .dout = BSP_I2S_DOUT,
+            .din = BSP_I2S_DSIN,
+        },
+    };
+    std.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_16BIT;
+    std.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    std.slot_cfg.ws_width = 32;
+    std.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s.tx, &std), TAG, "i2s tx");
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s.rx, &std), TAG, "i2s rx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s.tx), TAG, "i2s tx on");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s.rx), TAG, "i2s rx on");
+
+    audio_codec_i2s_cfg_t i2s_cfg = {
+        .port = CONFIG_BSP_I2S_NUM,
+        .tx_handle = s_i2s.tx,
+        .rx_handle = s_i2s.rx,
+    };
+    s_i2s.inner = audio_codec_new_i2s_data(&i2s_cfg);
+    ESP_RETURN_ON_FALSE(s_i2s.inner, ESP_ERR_NO_MEM, TAG, "i2s data");
+    s_i2s.base.open = slot_open;
+    s_i2s.base.is_open = slot_is_open;
+    s_i2s.base.enable = slot_enable;
+    s_i2s.base.set_fmt = slot_set_fmt;
+    s_i2s.base.read = slot_read;
+    s_i2s.base.write = slot_write;
+    s_i2s.base.close = slot_close;
+
+    esp_err_t rst = es8311_reset();
+    if (rst != ESP_OK) {
+        ESP_LOGW(TAG, "ES8311 reset skipped (%s)", esp_err_to_name(rst));
+    }
+
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
+    audio_codec_i2c_cfg_t i2c = {
+        .port = BSP_I2C_NUM,
+        .addr = ES8311_CODEC_DEFAULT_ADDR,
+        .bus_handle = bsp_i2c_get_handle(),
+    };
+    const audio_codec_ctrl_if_t *spk_ctrl = audio_codec_new_i2c_ctrl(&i2c);
+    ESP_RETURN_ON_FALSE(gpio_if && spk_ctrl, ESP_ERR_NO_MEM, TAG, "spk ctrl");
+    const audio_codec_if_t *spk_codec = es8311_codec_new(&(es8311_codec_cfg_t){
+        .ctrl_if = spk_ctrl,
+        .gpio_if = gpio_if,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = BSP_POWER_AMP_IO,
+        .pa_reverted = false,
+        .master_mode = false,
+        .use_mclk = true,
+        .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
+    });
+    ESP_RETURN_ON_FALSE(spk_codec, ESP_FAIL, TAG, "ES8311");
+    *spk = s_out = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = spk_codec,
+        .data_if = &s_i2s.base,
+    });
+
+    i2c.addr = ES7210_CODEC_DEFAULT_ADDR;
+    const audio_codec_ctrl_if_t *mic_ctrl = audio_codec_new_i2c_ctrl(&i2c);
+    ESP_RETURN_ON_FALSE(mic_ctrl, ESP_ERR_NO_MEM, TAG, "mic ctrl");
+    const audio_codec_if_t *mic_codec = es7210_codec_new(&(es7210_codec_cfg_t){
+        .ctrl_if = mic_ctrl,
+        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
+    });
+    ESP_RETURN_ON_FALSE(mic_codec, ESP_FAIL, TAG, "ES7210");
+    *mic = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = mic_codec,
+        .data_if = &s_i2s.base,
+    });
+    ESP_RETURN_ON_FALSE(*spk && *mic, ESP_FAIL, TAG, "codec dev");
+    ESP_LOGI(TAG, "I2S ready: %d Hz 16-in-32, MCLK %d BCLK %d WS %d DOUT %d DIN %d, PA GPIO%d, port %d",
+             MUSE_AUDIO_RATE, (int)BSP_I2S_MCLK, (int)BSP_I2S_SCLK, (int)BSP_I2S_LCLK, (int)BSP_I2S_DOUT,
+             (int)BSP_I2S_DSIN, (int)BSP_POWER_AMP_IO, CONFIG_BSP_I2S_NUM);
+    return ESP_OK;
 }
 
 static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
@@ -290,6 +626,9 @@ static const muse_board_t s_board = {
     .display_pause = display_pause,
     .draw_frame = muse_lcd_bands_frame,
     .audio_init = audio_init,
+    .audio_power = audio_power,
+    .speaker_probe = speaker_probe,
+    .boot_tone = boot_tone,
     .mic_slot = -1,
     .set_mic_gain = set_mic_gain,
     .poll_buttons = poll_buttons,

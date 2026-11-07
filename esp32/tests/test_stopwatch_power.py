@@ -346,6 +346,7 @@ static int esp_codec_dev_open(esp_codec_dev_handle_t h, esp_codec_dev_sample_inf
 }
 static int esp_codec_dev_close(esp_codec_dev_handle_t h) { char b[16]; snprintf(b, sizeof(b), "close-%s", who(h)); note(b); return 0; }
 static int esp_codec_dev_set_out_vol(esp_codec_dev_handle_t h, int v) { assert(h == &spk_dev); char b[16]; snprintf(b, sizeof(b), "vol%d", v); note(b); return 0; }
+static int esp_codec_dev_set_out_mute(esp_codec_dev_handle_t h, bool mute) { (void)h; (void)mute; return 0; }
 static int esp_codec_dev_set_in_gain(esp_codec_dev_handle_t h, float db) { assert(h == &mic_dev); char b[16]; snprintf(b, sizeof(b), "gain%d", (int)db); note(b); return 0; }
 static int muse_settings_volume(void) { return 70; }
 static int muse_settings_mic_gain(void) { return 24; }
@@ -362,6 +363,8 @@ static struct {
     void (*set_mic_gain)(esp_codec_dev_handle_t, int);
     void (*audio_power)(bool);
     void (*codec_power)(bool);
+    void (*speaker_probe)(esp_codec_dev_handle_t, const char *);
+    void (*boot_tone)(void);
     int (*mic_init)(void);
     int (*mic_power)(bool);
     int (*mic_read)(int16_t *, size_t);
@@ -376,6 +379,7 @@ static float s_mic_scale;
 static esp_codec_dev_handle_t s_spk;
 static esp_codec_dev_handle_t s_mic;
 static bool s_open;
+static bool s_heard;
 static SemaphoreHandle_t s_lock;
 ''' + "\n".join(function(audio, n) for n in (
             "lock", "unlock", "codec_power", "codecs_reachable", "apply_volume", "apply_mic_gain", "open_codecs",
@@ -414,7 +418,7 @@ int main(int argc, char **argv) {
     } else if (test == 3) {   /* init: rail first, codecs opened and set */
         s_spk = s_mic = NULL; s_open = false; s_lock = NULL; lock_ops = 0;
         assert(muse_audio_init(50, 20) == ESP_OK);
-        expect("rail-on audio-init open-spk open-mic vol50 gain20 ");
+        expect("rail-on audio-init open-spk open-mic vol50 gain20 amp-on ");
         assert(s_open && !locked);
     } else if (test == 4) {   /* init failures after the rail went on: each takes it down again */
         int cases[][4] = { { -5, 0, 0, -5 }, { 0, 1, 0, ESP_FAIL }, { 0, 0, 1, ESP_FAIL } };
