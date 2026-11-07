@@ -77,6 +77,7 @@ extern "C" {
 #include "muse_wifi.h"
 }
 #include "muse_chat_priv.h"
+#include "muse_volc_tts.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call_priv.h"
@@ -172,6 +173,8 @@ struct ev_t {
 static QueueHandle_t s_cmds, s_events;
 static StreamBufferHandle_t s_in, s_out;
 static std::atomic<uint32_t> s_gen{0};
+static std::atomic<bool> s_volc_live{false};
+static std::atomic<uint32_t> s_volc_gen{0};
 static std::atomic<bool> s_resting{false};
 
 /* ---- Connection ---- */
@@ -266,6 +269,7 @@ struct turn_t {
     /* TTS */
     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
+    bool volc;               /* Volcengine TTS is feeding s_out for tts_msg */
     uint8_t *mp3;            /* MP3_BUF */
     size_t mp3_len;
     bool mp3_ended;
@@ -1000,6 +1004,8 @@ static void turn_finish(void)
     s_turn.dict_id = s_turn.chat_id = 0;
     s_turn.tts_msg = -1;
     s_turn.silent = false;
+    s_turn.volc = false;
+    s_volc_live.store(false);
     s_turn.mp3_len = 0;
 }
 
@@ -1594,20 +1600,29 @@ static void start_tts(void)
             continue;
         }
         /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
+         * Replies are text. With a Volcengine key, muse_volc_tts speaks the
+         * kept text (s_turn.texts) and the voice task plays that PCM. Otherwise
+         * silence paces the captions. An MP3 from tts_data() still works: keep
+         * m.tts = TTS_ACTIVE, s_turn.silent = false, and feed tts_data().
          */
+        const char *spoken = s_turn.texts ? s_turn.texts + (size_t)i * TEXT_MAX : nullptr;
+        if (spoken && spoken[0] && muse_volc_tts_enabled()) {
+            s_volc_gen.store(s_turn.gen);
+            s_volc_live.store(true);
+            if (muse_volc_tts_submit(spoken)) {
+                m.pcm_start = s_turn.pcm_out;
+                m.pcm_frames = 0;
+                m.tts = TTS_ACTIVE;
+                s_turn.tts_msg = i;
+                s_turn.silent = false;
+                s_turn.volc = true;
+                ESP_LOGI(TAG, "volc tts message %s (%u chars)", m.id, (unsigned)m.len);
+                show_reply_start(m);
+                return;
+            }
+            s_volc_live.store(false);
+            ESP_LOGW(TAG, "volc tts not started, native reply audio");
+        }
         m.pcm_start = s_turn.pcm_out;
         /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
          * was kept at reading pace, not stretched over the whole reply's time
@@ -1668,10 +1683,42 @@ static void pace_silently(void)
 }
 
 /* Decodes buffered MP3 while the reply buffer has room. */
+static void volc_poll(void)
+{
+    int http = 0, api = 0;
+    uint32_t frames = 0;
+    int st = muse_volc_tts_take_result(&http, &api, &frames);
+    if (!st || s_turn.phase != P_WAIT_REPLY || s_turn.tts_msg < 0 || !s_turn.volc) {
+        return;
+    }
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    s_turn.volc = false;
+    s_volc_live.store(false);
+    if (frames) {
+        if (st < 0) {
+            ESP_LOGW(TAG, "volc tts ended early (http %d api %d) after %u frames", http, api, (unsigned)frames);
+        }
+        m.pcm_frames = frames;
+        s_turn.pcm_out = m.pcm_start + frames;
+        m.tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+        return;
+    }
+    /* Nothing reached the speaker: the silence that paces captions still plays. */
+    ESP_LOGW(TAG, "volc tts failed (http %d api %d), native reply audio", http, api);
+    s_turn.silent = true;
+    size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + s_turn.tts_msg * TEXT_MAX) : m.len;
+    m.pcm_start = s_turn.pcm_out;
+    m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+}
+
 static void decode(void)
 {
     if (s_turn.tts_msg < 0) {
         return;
+    }
+    if (s_turn.volc) {
+        return; /* muse_volc_tts is the only writer of the reply stream */
     }
     if (s_turn.silent) {
         pace_silently();
@@ -2137,6 +2184,7 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
+            volc_poll();
             decode();
         }
         if (!s_connected) {
@@ -2387,6 +2435,34 @@ extern "C" bool muse_hatch_turn_caption(size_t played, char *out, size_t cap)
 extern "C" size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms)
 {
     return xStreamBufferReceive(s_out, pcm, frames * sizeof(int16_t), pdMS_TO_TICKS(wait_ms)) / sizeof(int16_t);
+}
+
+extern "C" bool muse_hatch_reply_pcm(const int16_t *pcm, size_t frames)
+{
+    if (!pcm || !frames || !s_volc_live.load() || s_volc_gen.load() != s_gen.load() || !s_out) {
+        return false;
+    }
+    int64_t deadline = esp_timer_get_time() + 5000000;
+    size_t off = 0;
+    while (off < frames) {
+        if (!s_volc_live.load() || s_volc_gen.load() != s_gen.load()) {
+            return false;
+        }
+        size_t room = xStreamBufferSpacesAvailable(s_out) / sizeof(int16_t);
+        if (!room) {
+            if (esp_timer_get_time() > deadline) {
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        size_t n = frames - off < room ? frames - off : room;
+        if (xStreamBufferSend(s_out, pcm + off, n * sizeof(int16_t), 0) != n * sizeof(int16_t)) {
+            return false;
+        }
+        off += n;
+    }
+    return true;
 }
 
 /* Bench test: decodes the embedded test_reply.mp3 exactly as a reply is decoded. */

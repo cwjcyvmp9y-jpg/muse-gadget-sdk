@@ -47,7 +47,7 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "muse_ui.c" "muse_menu.c" "muse_settings_ui.c" "muse_keypad.c" "muse_lv_mem.c")
     endif()
     if(CONFIG_MUSE_HATCH)
-        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
+        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_volc_tts.c")
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
         if(CONFIG_MUSE_REALTIME_VOICE)
             list(APPEND srcs "muse_voice_call.cpp" "muse_voice_call_core.c")
@@ -184,7 +184,7 @@ if(CONFIG_MUSE_ENABLED)
 elseif(CONFIG_HOMEHUB_VOICE)
     # The Voice PE board uses just the Hatch voice session; the project's main/
     # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
-    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_chat_text.c" "muse_text.c")
+    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_volc_tts.c" "muse_chat_text.c" "muse_text.c")
     list(APPEND embed "test_reply.mp3")
     if(CONFIG_MUSE_REALTIME_VOICE)
         list(APPEND srcs "muse_voice_call.cpp" "muse_voice_call_core.c")
@@ -215,6 +215,10 @@ idf_component_register(
     REQUIRES esp_driver_gpio esp_driver_i2c
     PRIV_REQUIRES ${muse_priv_requires}
 )
+
+# main/volc_tts_secret.h is gitignored and may appear after configure.
+# __has_include picks it up on the next compile of muse_volc_tts.c.
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_SOURCE_DIR}/main")
 
 if(CONFIG_MUSE_UI_FREEINK)
     # FreeInk's board profile, for the panel and its pins. PUBLIC: FreeInk's
