@@ -212,6 +212,14 @@ if(IDF_TARGET STREQUAL "esp32p4")
     list(APPEND muse_priv_requires esp_driver_jpeg)
 endif()
 
+if(CONFIG_MUSE_UI_CAT_FACE)
+    list(APPEND embed
+        "assets/cat/cat_idle.jpg"
+        "assets/cat/cat_listen.jpg"
+        "assets/cat/cat_think.jpg"
+        "assets/cat/cat_speak.jpg")
+endif()
+
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."

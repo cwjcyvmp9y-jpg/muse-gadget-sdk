@@ -233,6 +233,17 @@ menu "Muse"
         default "STICKY" if MUSE_BOARD_RETERMINAL_STICKY
         default ""
 
+    config MUSE_UI_CAT_FACE
+        bool "Cat face instead of the drawn Muse"
+        depends on MUSE_ENABLED && SPIRAM && !MUSE_UI_FREEINK
+        default y if MUSE_BOARD_WAVESHARE_S3_175C
+        default n
+        help
+            Show four embedded JPEGs (idle, listening, thinking, speaking)
+            in place of the drawn character. They are decoded once at boot
+            into PSRAM. Default on for the Waveshare 1.75C. Other boards
+            keep the drawn Muse.
+
     config MUSE_STICKY_SD
         bool "Mount the reTerminal Sticky's microSD card at /sdcard"
         depends on MUSE_BOARD_RETERMINAL_STICKY

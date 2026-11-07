@@ -66,6 +66,9 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
 
+# Full-screen cat face instead of the drawn character.
+CONFIG_MUSE_UI_CAT_FACE=y
+
 # Shadowsocks 2022 bridge (muse_proxy.c): loopback listeners, the node
 # connection, and a second SNTP server for the SIP022 timestamp.
 # LOOPBACK_MAX_PBUFS is capped at 16 by this ESP-IDF.
