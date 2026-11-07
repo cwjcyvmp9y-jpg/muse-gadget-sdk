@@ -45,6 +45,9 @@ factory_test_signing_key.pem
 # Volcengine TTS API key. Written locally; never commit it.
 main/volc_tts_secret.h
 
+# Shadowsocks 2022 node. Written locally; never commit it.
+main/ss_proxy_secret.h
+
 .DS_Store
 
 # Python test bytecode

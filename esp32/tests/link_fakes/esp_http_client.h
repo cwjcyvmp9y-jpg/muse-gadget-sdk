@@ -69,6 +69,7 @@ typedef struct {
     bool disable_auto_redirect;
     bool keep_alive_enable;
     int max_redirection_count;
+    const char *common_name;
 } esp_http_client_config_t;
 
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config);

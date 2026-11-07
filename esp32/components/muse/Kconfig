@@ -459,6 +459,40 @@ menu "Muse"
             X-Api-Resource-Id. seed-tts-2.0 is 豆包语音合成模型2.0
             (Doubao speech synthesis 2.0).
 
+    config MUSE_SS_PROXY_ENABLE
+        bool "Shadowsocks 2022 proxy for Muse connections"
+        depends on SPIRAM
+        default n
+        help
+            Tunnel TCP port 443 to Muse and other overseas hosts through one
+            Shadowsocks 2022 node (2022-blake3-aes-128-gcm, a 16-byte PSK).
+            TLS certificate checks stay on the original hostname.
+            openspeech.bytedance.com (Volcengine TTS) is never tunneled.
+            A gitignored esp32/main/ss_proxy_secret.h that defines a non-empty
+            SS_PROXY_KEY turns this on and overrides the server, port and key
+            below. Never commit a real key. The 1.75C overlay raises
+            LWIP_MAX_SOCKETS, loopback pbufs and SNTP servers for the bridge.
+
+    config MUSE_SS_SERVER
+        string "Shadowsocks server IPv4 address"
+        depends on MUSE_SS_PROXY_ENABLE
+        default ""
+
+    config MUSE_SS_PORT
+        int "Shadowsocks server TCP port"
+        depends on MUSE_SS_PROXY_ENABLE
+        range 1 65535
+        default 24443
+
+    config MUSE_SS_KEY
+        string "Shadowsocks 2022 base64 PSK"
+        depends on MUSE_SS_PROXY_ENABLE
+        default ""
+        help
+            Base64 of the 16-byte 2022-blake3-aes-128-gcm PSK. Leave this empty
+            and write esp32/main/ss_proxy_secret.h instead so the key is not
+            stored in sdkconfig. Never commit a real key.
+
     config MUSE_REALTIME_VOICE
         bool "Live voice calls with Muse (experimental)"
         depends on (MUSE_HATCH || HOMEHUB_VOICE) && SPIRAM

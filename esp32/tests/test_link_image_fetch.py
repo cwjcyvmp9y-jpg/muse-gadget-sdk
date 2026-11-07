@@ -95,6 +95,8 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 str(ROOT / "tests" / "link_fakes"),
                 "-I",
                 str(ROOT / "main"),
+                "-I",
+                str(ROOT / "components" / "muse"),
                 str(ROOT / "tests" / "link_image_fetch_harness.c"),
                 str(wrapped_source),
                 "-o",

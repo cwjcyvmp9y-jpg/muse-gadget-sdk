@@ -78,6 +78,7 @@ extern "C" {
 }
 #include "muse_chat_priv.h"
 #include "muse_volc_tts.h"
+#include "muse_proxy.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call_priv.h"
@@ -866,7 +867,18 @@ static bool connect_once(char *err, size_t err_cap, int *http_status)
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 15000;
     int64_t t0 = now_us();
-    if (esp_tls_conn_new_sync(s_host, strlen(s_host), NOISE_PORT, &cfg, c.tls) != 1) {
+    const char *connect_host = s_host;
+    uint16_t connect_port = NOISE_PORT;
+    bool via_proxy = false;
+    if (muse_proxy_prepare(s_host, NOISE_PORT, &via_proxy, &connect_port) != ESP_OK) {
+        strlcpy(err, "Proxy route/clock unavailable", err_cap);
+        return false;
+    }
+    if (via_proxy) {
+        cfg.common_name = s_host;
+        connect_host = "127.0.0.1";
+    }
+    if (esp_tls_conn_new_sync(connect_host, strlen(connect_host), connect_port, &cfg, c.tls) != 1) {
         snprintf(err, err_cap, "Can't reach %s", s_host);
         return false;
     }

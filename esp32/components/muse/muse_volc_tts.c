@@ -26,6 +26,8 @@
  *
  * The key comes from main/volc_tts_secret.h (VOLC_TTS_API_KEY) when that
  * gitignored file exists, otherwise from CONFIG_MUSE_VOLC_TTS_API_KEY.
+ * This request stays on the open network. openspeech.bytedance.com is a
+ * China service and is not sent through the Shadowsocks bridge.
  */
 
 #include "muse_volc_tts.h"

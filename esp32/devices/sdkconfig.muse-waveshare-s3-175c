@@ -65,3 +65,10 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # actually slept, and how long each power lock kept the chip awake.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
+
+# Shadowsocks 2022 bridge (muse_proxy.c): loopback listeners, the node
+# connection, and a second SNTP server for the SIP022 timestamp.
+# LOOPBACK_MAX_PBUFS is capped at 16 by this ESP-IDF.
+CONFIG_LWIP_MAX_SOCKETS=24
+CONFIG_LWIP_LOOPBACK_MAX_PBUFS=16
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
