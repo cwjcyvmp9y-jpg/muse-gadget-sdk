@@ -27,6 +27,7 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "muse_proxy.h"
 
 static const char *TAG = "link.vm_api";
 static char s_api_base[256] = VM_API_DEFAULT_BASE_URL;
@@ -140,8 +141,20 @@ static int http_json(const char *url, esp_http_client_method_t method,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_redirect = true,
     };
+    char proxy_url[512];
+    char origin[256];
+    if (muse_proxy_http_url(url, proxy_url, sizeof(proxy_url), origin, sizeof(origin)) != ESP_OK) {
+        return VM_API_ERR_FAILED;
+    }
+    cfg.url = proxy_url;
+    if (strcmp(proxy_url, url) != 0) {
+        cfg.common_name = origin;
+    }
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return VM_API_ERR_FAILED;
+    if (strcmp(proxy_url, url) != 0) {
+        esp_http_client_set_header(client, "Host", origin);
+    }
 
     if (auth_header && *auth_header) {
         esp_http_client_set_header(client, "Authorization", auth_header);

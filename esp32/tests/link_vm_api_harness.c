@@ -29,6 +29,12 @@
 
 void *esp_crt_bundle_attach = NULL;
 
+esp_err_t muse_proxy_http_url(const char *url, char *out, size_t cap, char *origin, size_t origin_cap) {
+    snprintf(out, cap, "%s", url);
+    if (origin && origin_cap) origin[0] = '\0';
+    return ESP_OK;
+}
+
 typedef struct {
     esp_err_t err;
     int status;

@@ -122,6 +122,10 @@ void muse_chat_set_caption_px(int width_px, int (*glyph_px)(uint32_t letter, uin
 /* Reply speech as 16 kHz mono. Waits up to wait_ms for some; returns frames read. */
 size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms);
 
+/* Queue 16 kHz mono PCM into the reply the voice task plays (muse_audio_write).
+ * False if this turn is no longer accepting it. */
+bool muse_hatch_reply_pcm(const int16_t *pcm, size_t frames);
+
 /* Bench test: decodes a built-in MP3 to 16 kHz; caller frees *pcm. Returns frames. */
 size_t muse_hatch_mp3_selftest(int16_t **pcm);
 

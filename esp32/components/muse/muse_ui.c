@@ -43,6 +43,9 @@
 #include "muse_pixel.h"
 #include "muse_settings.h"
 #include "muse_settings_ui.h"
+#if CONFIG_MUSE_UI_CAT_FACE
+#include "rom/tjpgd.h"
+#endif
 #include "muse_state.h"
 #include "muse_text.h"
 #include "muse_wifi.h"
@@ -352,6 +355,157 @@ static void muse_image_init(void)
         s_cells = s_cell_row = NULL;   /* redraw all of Muse every frame */
     }
 }
+
+#if CONFIG_MUSE_UI_CAT_FACE
+/* Four full-screen faces, decoded once. Switching is a pointer change. */
+enum { CAT_IDLE, CAT_LISTEN, CAT_THINK, CAT_SPEAK, CAT_COUNT };
+static bool s_cat_on;
+static int s_cat_shown = -1;
+static lv_image_dsc_t s_cat_dsc[CAT_COUNT];
+
+typedef struct {
+    const uint8_t *data;
+    size_t length;
+    size_t offset;
+    uint16_t *px;
+    int w;
+    int h;
+} cat_jpg_t;
+
+static UINT cat_jpg_read(JDEC *jd, BYTE *buf, UINT count)
+{
+    cat_jpg_t *src = jd->device;
+    size_t remain = src->length - src->offset;
+    if (count > remain) {
+        count = (UINT)remain;
+    }
+    if (buf && count) {
+        memcpy(buf, src->data + src->offset, count);
+    }
+    src->offset += count;
+    return count;
+}
+
+static UINT cat_jpg_write(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    cat_jpg_t *src = jd->device;
+    const uint8_t *rgb = bitmap;
+    int sw = rect->right - rect->left + 1;
+    int y1 = rect->top < src->h ? rect->top : src->h;
+    int y2 = rect->bottom < src->h ? rect->bottom : src->h - 1;
+    for (int y = y1; y <= y2; y++) {
+        uint16_t *dst = src->px + (size_t)y * src->w;
+        for (int x = rect->left; x <= rect->right && x < src->w; x++) {
+            size_t si = ((size_t)(y - rect->top) * sw + (size_t)(x - rect->left)) * 3;
+            dst[x] = (uint16_t)(((rgb[si] & 0xF8) << 8) | ((rgb[si + 1] & 0xFC) << 3) | (rgb[si + 2] >> 3));
+        }
+    }
+    return 1;
+}
+
+static bool cat_decode(const uint8_t *jpg, size_t len, lv_image_dsc_t *dsc, const char *name)
+{
+    void *pool = heap_caps_malloc(16384, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!pool) {
+        pool = heap_caps_malloc(16384, MUSE_BIG_CAPS);
+    }
+    if (!pool) {
+        ESP_LOGE(TAG, "cat %s: no JPEG work buffer", name);
+        return false;
+    }
+    cat_jpg_t src = { .data = jpg, .length = len };
+    JDEC jd;
+    JRESULT rc = jd_prepare(&jd, cat_jpg_read, pool, 16384, &src);
+    if (rc != JDR_OK || !jd.width || !jd.height) {
+        ESP_LOGE(TAG, "cat %s: JPEG prepare failed (%d)", name, (int)rc);
+        free(pool);
+        return false;
+    }
+    src.w = (int)jd.width;
+    src.h = (int)jd.height;
+    src.px = heap_caps_malloc((size_t)src.w * src.h * sizeof(uint16_t), MUSE_BIG_CAPS);
+    if (!src.px) {
+        ESP_LOGE(TAG, "cat %s: no PSRAM for %dx%d", name, src.w, src.h);
+        free(pool);
+        return false;
+    }
+    rc = jd_decomp(&jd, cat_jpg_write, 0);
+    free(pool);
+    if (rc != JDR_OK) {
+        ESP_LOGE(TAG, "cat %s: JPEG decode failed (%d)", name, (int)rc);
+        free(src.px);
+        return false;
+    }
+    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+    dsc->header.w = src.w;
+    dsc->header.h = src.h;
+    dsc->header.stride = src.w * sizeof(uint16_t);
+    dsc->data_size = (uint32_t)src.w * src.h * sizeof(uint16_t);
+    dsc->data = (const uint8_t *)src.px;
+    ESP_LOGI(TAG, "cat %s: %dx%d RGB565", name, src.w, src.h);
+    return true;
+}
+
+static bool cat_load(void)
+{
+    extern const uint8_t idle_start[] asm("_binary_cat_idle_jpg_start");
+    extern const uint8_t idle_end[] asm("_binary_cat_idle_jpg_end");
+    extern const uint8_t listen_start[] asm("_binary_cat_listen_jpg_start");
+    extern const uint8_t listen_end[] asm("_binary_cat_listen_jpg_end");
+    extern const uint8_t think_start[] asm("_binary_cat_think_jpg_start");
+    extern const uint8_t think_end[] asm("_binary_cat_think_jpg_end");
+    extern const uint8_t speak_start[] asm("_binary_cat_speak_jpg_start");
+    extern const uint8_t speak_end[] asm("_binary_cat_speak_jpg_end");
+    const uint8_t *starts[CAT_COUNT] = { idle_start, listen_start, think_start, speak_start };
+    const uint8_t *ends[CAT_COUNT] = { idle_end, listen_end, think_end, speak_end };
+    const char *names[CAT_COUNT] = { "idle", "listen", "think", "speak" };
+    for (int i = 0; i < CAT_COUNT; i++) {
+        if (!cat_decode(starts[i], (size_t)(ends[i] - starts[i]), &s_cat_dsc[i], names[i])) {
+            for (int j = 0; j < i; j++) {
+                free((void *)s_cat_dsc[j].data);
+                s_cat_dsc[j].data = NULL;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Idle, boot, error and off share the resting face. Speaking blinks the mouth. */
+static int cat_for(muse_mode_t mode, float now)
+{
+    if (mode == MUSE_MODE_LISTENING) {
+        return CAT_LISTEN;
+    }
+    if (mode == MUSE_MODE_THINKING) {
+        return CAT_THINK;
+    }
+    if (mode == MUSE_MODE_SPEAKING) {
+        return ((int)(now * 4.0f) & 1) ? CAT_SPEAK : CAT_IDLE;
+    }
+    return CAT_IDLE;
+}
+
+static void cat_show(muse_mode_t mode, float now)
+{
+    int i = cat_for(mode, now);
+    if (i == s_cat_shown) {
+        return;
+    }
+    s_cat_shown = i;
+    lv_image_set_src(s_canvas, &s_cat_dsc[i]);
+}
+
+static void cat_backdrop(lv_obj_t *label)
+{
+    lv_obj_set_style_bg_color(label, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_70, 0);
+    lv_obj_set_style_pad_hor(label, 6, 0);
+    lv_obj_set_style_pad_ver(label, 2, 0);
+    lv_obj_set_style_radius(label, 8, 0);
+}
+#endif
 
 /*
  * Most frames change only a few of Muse's cells, so only those are redrawn.
@@ -775,6 +929,11 @@ static void move_muse_t(void *obj, int32_t t)
 /* Eases Muse to `px` centred at `y`, from wherever it is now. */
 static void move_muse(int px, int y)
 {
+#if CONFIG_MUSE_UI_CAT_FACE
+    if (s_cat_on) {
+        return;   /* the cat fills the round screen; the reply stays in its band */
+    }
+#endif
     s_from_px = s_muse_src.header.w;
     s_from_y = s_muse_y;
     s_to_px = px;
@@ -932,6 +1091,11 @@ static void build_answer(lv_obj_t *face, int ring_in)
              s_answers[ANSWER_HEARD].lines, l->cols, l->lines);
 
     s_reply_lbl = make_label(face, font, COLOR_CAPTION);
+#if CONFIG_MUSE_UI_CAT_FACE
+    if (s_cat_on) {
+        cat_backdrop(s_reply_lbl);
+    }
+#endif
     lv_obj_set_style_text_line_space(s_reply_lbl, CAPTION_LINE_SPACE, 0);
     /* Pages come wrapped to fit; the transcript while thinking doesn't. */
     lv_label_set_long_mode(s_reply_lbl, LV_LABEL_LONG_MODE_WRAP);
@@ -1198,14 +1362,25 @@ static void build_screen(void)
     s_big_y = -25;
 #endif
 
-    /* The character. */
-    muse_image_init();
-    s_canvas = lv_image_create(face);
-    lv_image_set_src(s_canvas, &s_muse_src);
-    lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, s_big_y);
-    s_muse_y = s_big_y;
-    lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_canvas, on_canvas_clicked, LV_EVENT_CLICKED, NULL);
+    /* The character. The cat fills the panel; the drawn Muse stays for every other board. */
+#if CONFIG_MUSE_UI_CAT_FACE
+    if (s_cat_on) {
+        s_canvas = lv_image_create(face);
+        lv_image_set_src(s_canvas, &s_cat_dsc[CAT_IDLE]);
+        s_cat_shown = CAT_IDLE;
+        lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, 0);
+        s_muse_y = 0;
+    } else
+#endif
+    {
+        muse_image_init();
+        s_canvas = lv_image_create(face);
+        lv_image_set_src(s_canvas, &s_muse_src);
+        lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, s_big_y);
+        s_muse_y = s_big_y;
+        lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_canvas, on_canvas_clicked, LV_EVENT_CLICKED, NULL);
+    }
     if (s_ring) {
         /* The canvas's black corners reach the bezel; keep the ring on top. */
         lv_obj_move_foreground(s_ring);
@@ -1336,6 +1511,11 @@ static void build_screen(void)
         return;
     }
     /* Fixed height: a longer caption ends in dots rather than growing into the ring. */
+#if CONFIG_MUSE_UI_CAT_FACE
+    if (s_cat_on) {
+        cat_backdrop(s_caption_lbl);   /* the lower band stays readable over the face */
+    }
+#endif
     lv_obj_set_size(s_caption_lbl, CAPTION_W, cap_h);
     lv_obj_set_style_text_line_space(s_caption_lbl, CAPTION_LINE_SPACE, 0);
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
@@ -2145,6 +2325,13 @@ static void frame_tick(lv_timer_t *timer)
     if (muse_voice_in_call() &&
         ((mode == MUSE_MODE_LISTENING) != (muse_voice_call_view() == MUSE_VOICE_VIEW_LISTENING))) level = 0;
     s_level += (level - s_level) * (level > s_level ? 0.6f : 0.2f);
+#if CONFIG_MUSE_UI_CAT_FACE
+    if (s_cat_on) {
+        cat_show(mode, now);
+        update_status(mode, now);
+        return;
+    }
+#endif
 
     muse_pose_t pose = {
         .mode = mode,
@@ -2203,6 +2390,12 @@ esp_err_t muse_ui_start(void)
     }
 
     s_image_mutex = xSemaphoreCreateMutex();
+#if CONFIG_MUSE_UI_CAT_FACE
+    s_cat_on = cat_load();
+    if (!s_cat_on) {
+        ESP_LOGW(TAG, "cat face unavailable, drawn Muse stays");
+    }
+#endif
     muse_board->display_lock(-1);
     build_screen();
     if (s_settings) {

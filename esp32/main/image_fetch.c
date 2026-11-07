@@ -33,6 +33,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "muse_proxy.h"
 #include "esp_timer.h"
 #include "noise_tunnel_internal.h"
 #include "freertos/FreeRTOS.h"
@@ -735,6 +736,42 @@ static bool same_scheme(fetch_t *f) {
                     : strncasecmp(url, "http://", 7) == 0;
 }
 
+/* One download at a time (s_busy). These hold the URL the HTTP client keeps. */
+static char s_proxied[1024];
+static char s_origin[256];
+static char s_next[1024];
+
+static bool open_client(fetch_t *f, const char *url) {
+    const char *use = url;
+    const char *cn = NULL;
+    if (f->https) {
+        if (muse_proxy_http_url(url, s_proxied, sizeof(s_proxied), s_origin, sizeof(s_origin)) != ESP_OK) {
+            return false;
+        }
+        use = s_proxied;
+        if (strcmp(s_proxied, url) != 0) cn = s_origin;
+    }
+    esp_http_client_config_t cfg = {
+        .url = use,
+        .common_name = cn,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = FETCH_TIMEOUT_MS,
+        .buffer_size = 1024,
+        .buffer_size_tx = 512,
+        .disable_auto_redirect = true,
+        .event_handler = on_http_event,
+        .user_data = f,
+    };
+    f->http = esp_http_client_init(&cfg);
+    if (!f->http) return false;
+    if (cn && esp_http_client_set_header(f->http, "Host", s_origin) != ESP_OK) {
+        esp_http_client_cleanup(f->http);
+        f->http = NULL;
+        return false;
+    }
+    return true;
+}
+
 static esp_err_t open_following_redirects(fetch_t *f, int *status) {
     for (int i = 0;; i++) {
         if (!within_deadline(f)) return ESP_ERR_TIMEOUT;
@@ -752,23 +789,27 @@ static esp_err_t open_following_redirects(fetch_t *f, int *status) {
             f->scheme_changed = true;
             return ESP_FAIL;
         }
+        if (!f->https || esp_http_client_get_url(f->http, s_next, sizeof(s_next)) != ESP_OK) continue;
+        char previous[256];
+        strlcpy(previous, s_origin, sizeof(previous));
+        if (muse_proxy_http_url(s_next, s_proxied, sizeof(s_proxied), s_origin, sizeof(s_origin)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        if (strcmp(s_proxied, s_next) == 0) continue;
+        if (strcmp(s_origin, previous) != 0) {
+            esp_http_client_cleanup(f->http);
+            f->http = NULL;
+            if (!open_client(f, s_next)) return ESP_FAIL;
+        } else if (esp_http_client_set_url(f->http, s_proxied) != ESP_OK) {
+            return ESP_FAIL;
+        }
     }
 }
 
 // Opens the URL, following redirects, ready to read the body. False with
 // result->message set if it can't.
 static bool http_open(fetch_t *f, image_fetch_result_t *result, char *msg, size_t msg_len) {
-    esp_http_client_config_t cfg = {
-        .url = f->url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = FETCH_TIMEOUT_MS,
-        .buffer_size = 1024,
-        .buffer_size_tx = 512,
-        .disable_auto_redirect = true,
-        .event_handler = on_http_event,
-        .user_data = f,
-    };
-    f->http = esp_http_client_init(&cfg);
+    if (!open_client(f, f->url)) f->http = NULL;
     int status = 0;
     esp_err_t err = f->http ? open_following_redirects(f, &status) : ESP_ERR_NO_MEM;
     log_memory("image download connected");

@@ -33,6 +33,7 @@
 #include "esp_timer.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
+#include "muse_proxy.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -2063,8 +2064,20 @@ static session_result_t run_session(stack_monitor_t *stack) {
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 15000;
 
-    int r = esp_tls_conn_new_sync(s_noise_host, static_cast<int>(strlen(s_noise_host)),
-                                  NOISE_PORT, &cfg, tls);
+    const char *connect_host = s_noise_host;
+    uint16_t connect_port = NOISE_PORT;
+    bool via_proxy = false;
+    if (muse_proxy_prepare(s_noise_host, NOISE_PORT, &via_proxy, &connect_port) != ESP_OK) {
+        ESP_LOGE(TAG, "proxy route/clock unavailable");
+        esp_tls_conn_destroy(tls);
+        return SESSION_FAILED;
+    }
+    if (via_proxy) {
+        cfg.common_name = s_noise_host;
+        connect_host = "127.0.0.1";
+    }
+    int r = esp_tls_conn_new_sync(connect_host, static_cast<int>(strlen(connect_host)),
+                                  connect_port, &cfg, tls);
     if (r != 1) {
         ESP_LOGE(TAG, "TLS connect failed: %d", r);
         esp_tls_conn_destroy(tls);
