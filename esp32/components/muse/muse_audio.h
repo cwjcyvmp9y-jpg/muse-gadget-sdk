@@ -49,6 +49,11 @@ void muse_audio_loopback_test(int volume);
 /* Blocking read of `frames` mono samples (mic pair mixed down). */
 esp_err_t muse_audio_read(int16_t *mono, size_t frames);
 
+#if CONFIG_MUSE_AUDIO_AFE
+/* Interleaved stereo frames (L, R, ...) for the AFE feed task. */
+esp_err_t muse_audio_read_interleaved(int16_t *interleaved, size_t frames);
+#endif
+
 /* Blocking write of `frames` mono samples to the speaker. */
 esp_err_t muse_audio_write(const int16_t *mono, size_t frames);
 

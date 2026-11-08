@@ -37,8 +37,10 @@ static const char *TAG = "muse_pmu";
 #define REG_INTSTS1 0x48
 #define REG_INTSTS2 0x49
 #define REG_DCDC_ONOFF 0x80     /* bits[4:0] = DCDC5..1 */
+#define REG_DCDC1_VOL 0x82      /* 1.5 V + n * 100 mV in bits[4:0] */
 #define REG_LDO_ONOFF0 0x90     /* ALDO1-4, BLDO1-2, CPUSLDO, DLDO1 from bit0 */
 #define REG_LDO_ONOFF1 0x91     /* bit0 = DLDO2 */
+#define REG_ALDO1_VOL 0x92      /* 0.5 V + n * 100 mV in bits[4:0] */
 #define REG_BAT_PERCENT 0xA4
 
 /* INTEN2 / INTSTS2 power-key bits. */
@@ -134,6 +136,24 @@ esp_err_t muse_pmu_keep_rails(uint8_t dcdc, uint16_t ldo)
     ESP_RETURN_ON_ERROR(wr(REG_LDO_ONOFF1, ldo1_new), TAG, "ldo1 off");
     ESP_LOGI(TAG, "rails: DCDC %02x -> %02x, LDO %02x %02x -> %02x %02x", dc & 0x1F, dc_new & 0x1F, ldo0,
              ldo1 & 0x01, ldo0_new, ldo1_new & 0x01);
+    return ESP_OK;
+}
+
+esp_err_t muse_pmu_set_dcdc1_aldo1_3v3(void)
+{
+    uint8_t v;
+    ESP_RETURN_ON_FALSE(s_dev, ESP_ERR_INVALID_STATE, TAG, "no PMU");
+    /* Same codes as Waveshare's AXP2101 example and xiaozhi's 1.75(C) board.
+     * The top bits of each voltage register are not the code. */
+    ESP_RETURN_ON_ERROR(rd(REG_DCDC1_VOL, &v), TAG, "read dcdc1 voltage");
+    ESP_RETURN_ON_ERROR(wr(REG_DCDC1_VOL, (v & 0xE0) | (uint8_t)((3300 - 1500) / 100)), TAG, "dcdc1 3.3 V");
+    ESP_RETURN_ON_ERROR(rd(REG_ALDO1_VOL, &v), TAG, "read aldo1 voltage");
+    ESP_RETURN_ON_ERROR(wr(REG_ALDO1_VOL, (v & 0xE0) | (uint8_t)((3300 - 500) / 100)), TAG, "aldo1 3.3 V");
+    ESP_RETURN_ON_ERROR(rd(REG_DCDC_ONOFF, &v), TAG, "read dcdc");
+    ESP_RETURN_ON_ERROR(wr(REG_DCDC_ONOFF, v | 0x01), TAG, "dcdc1 on");
+    ESP_RETURN_ON_ERROR(rd(REG_LDO_ONOFF0, &v), TAG, "read ldo0");
+    ESP_RETURN_ON_ERROR(wr(REG_LDO_ONOFF0, v | 0x01), TAG, "aldo1 on");
+    ESP_LOGI(TAG, "DCDC1 and ALDO1 at 3.3 V, on");
     return ESP_OK;
 }
 

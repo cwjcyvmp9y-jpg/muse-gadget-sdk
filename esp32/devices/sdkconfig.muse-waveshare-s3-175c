@@ -19,6 +19,10 @@ CONFIG_MUSE_BOARD_WAVESHARE_S3_175C=y
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
 
+# Dual-mic noise suppression. nsnet2 is the only model packed into srmodels.bin.
+CONFIG_MUSE_AUDIO_AFE=y
+CONFIG_SR_NSN_NSNET2=y
+
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
@@ -65,3 +69,10 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # actually slept, and how long each power lock kept the chip awake.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
+
+# Shadowsocks 2022 bridge (muse_proxy.c): loopback listeners, the node
+# connection, and a second SNTP server for the SIP022 timestamp.
+# LOOPBACK_MAX_PBUFS is capped at 16 by this ESP-IDF.
+CONFIG_LWIP_MAX_SOCKETS=24
+CONFIG_LWIP_LOOPBACK_MAX_PBUFS=16
+CONFIG_LWIP_SNTP_MAX_SERVERS=2

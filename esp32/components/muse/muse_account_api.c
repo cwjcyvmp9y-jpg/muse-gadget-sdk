@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "muse_proxy.h"
 
 static const char *TAG = "muse_account_api";
 
@@ -63,9 +64,21 @@ static int fetch(const char *auth, resp_t *r)
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_redirect = true,
     };
+    char url[384];
+    char origin[256];
+    if (muse_proxy_http_url(FETCH_URL, url, sizeof(url), origin, sizeof(origin)) != ESP_OK) {
+        return 0;
+    }
+    cfg.url = url;
+    if (strcmp(url, FETCH_URL) != 0) {
+        cfg.common_name = origin;
+    }
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) {
         return 0;
+    }
+    if (strcmp(url, FETCH_URL) != 0) {
+        esp_http_client_set_header(c, "Host", origin);
     }
     esp_http_client_set_header(c, "Authorization", auth);
     esp_http_client_set_header(c, "X-API-Version", "1.0.0");

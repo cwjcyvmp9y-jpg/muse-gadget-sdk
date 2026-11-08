@@ -32,6 +32,9 @@
 #include "muse_board.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
+#if CONFIG_MUSE_AUDIO_AFE
+#include "muse_afe.h"
+#endif
 
 static const char *TAG = "muse_audio";
 
@@ -41,6 +44,8 @@ static const char *TAG = "muse_audio";
 static esp_codec_dev_handle_t s_spk;
 static esp_codec_dev_handle_t s_mic;
 static bool s_open;
+static bool s_heard;          /* the write in progress follows audible audio */
+static int64_t s_last_write;  /* us; a gap before the next audible chunk probes again */
 /* Opening, closing and the volume and gain setters, which other tasks call:
  * with a board-switched codec supply, none may reach a codec mid-switch. */
 static SemaphoreHandle_t s_lock;
@@ -83,7 +88,8 @@ static bool codecs_reachable(void)
 static void apply_volume(int volume)
 {
     if (s_spk && codecs_reachable()) {
-        esp_codec_dev_set_out_vol(s_spk, volume);
+        int rc = esp_codec_dev_set_out_vol(s_spk, volume);
+        ESP_LOGI(TAG, "volume set: %d (%s)", volume, rc == ESP_CODEC_DEV_OK ? "ok" : "fail");
     }
 }
 
@@ -110,7 +116,10 @@ static esp_err_t open_codecs(void)
         .channel = CHANNELS,
         .bits_per_sample = 16,
     };
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_spk, &fs) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "open speaker");
+    int spk_rc = esp_codec_dev_open(s_spk, &fs);
+    ESP_LOGI(TAG, "codec open: speaker %d Hz, %d ch, %d-bit (%s)", (int)fs.sample_rate, fs.channel,
+             fs.bits_per_sample, spk_rc == ESP_CODEC_DEV_OK ? "ok" : "fail");
+    ESP_RETURN_ON_FALSE(spk_rc == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "open speaker");
     if (s_mic) {
         if (esp_codec_dev_open(s_mic, &fs) != ESP_CODEC_DEV_OK) {
             esp_codec_dev_close(s_spk);
@@ -118,6 +127,9 @@ static esp_err_t open_codecs(void)
             return ESP_FAIL;
         }
     }
+    /* Enable already clears the ES8311 mute; say so again in case a later
+     * open left it set. */
+    esp_codec_dev_set_out_mute(s_spk, false);
     s_open = true;
     return ESP_OK;
 }
@@ -178,12 +190,24 @@ esp_err_t muse_audio_init(int volume, int mic_gain_db)
     }
     muse_audio_set_volume(volume);
     muse_audio_set_mic_gain(mic_gain_db);
+    /* The amp enable (where the board has one) goes on once the codecs are
+     * open and the volume is set, including this first open. A later rest
+     * turns it off before the codecs close. */
+    if (!muse_board->mic_init && muse_board->audio_power) {
+        muse_board->audio_power(true);
+    }
+    if (!muse_board->mic_init && s_spk && muse_board->speaker_probe) {
+        muse_board->speaker_probe(s_spk, "open");
+    }
 
     float rc = 1.0f / (2.0f * (float)M_PI * HPF_HZ);
     float dt = 1.0f / MUSE_AUDIO_RATE;
     s_hpf_a = rc / (rc + dt);
 
     ESP_LOGI(TAG, "audio ready: %d Hz, %d ch, vol %d, mic gain %d dB", MUSE_AUDIO_RATE, CHANNELS, volume, mic_gain_db);
+    if (!muse_board->mic_init && muse_board->boot_tone) {
+        muse_board->boot_tone();
+    }
     return ESP_OK;
 }
 
@@ -214,6 +238,9 @@ void muse_audio_power(bool on)
             if (muse_board->audio_power) {
                 muse_board->audio_power(true);
             }
+            if (muse_board->speaker_probe) {
+                muse_board->speaker_probe(s_spk, "open");
+            }
         } else {
             /* Still closed (open_codecs closes the speaker if the mic fails)
              * and the amp still off: take the supply down again too. The
@@ -221,6 +248,9 @@ void muse_audio_power(bool on)
             codec_power(false);
         }
     } else {
+#if CONFIG_MUSE_AUDIO_AFE
+        muse_afe_stop();
+#endif
         if (muse_board->audio_power) {
             muse_board->audio_power(false);
         }
@@ -230,6 +260,7 @@ void muse_audio_power(bool on)
         }
         s_open = false;
         codec_power(false);
+        s_heard = false;
     }
     esp_log_level_set("i2s_common", lvl);
     unlock();
@@ -391,8 +422,29 @@ void muse_audio_loopback_test(int volume)
     muse_audio_set_volume(muse_settings_volume());
 }
 
+#if CONFIG_MUSE_AUDIO_AFE
+esp_err_t muse_audio_read_interleaved(int16_t *interleaved, size_t frames)
+{
+    if (!interleaved || !frames || !s_open || !s_mic) {
+        return ESP_FAIL;
+    }
+    return esp_codec_dev_read(s_mic, interleaved, frames * CHANNELS * sizeof(int16_t)) == ESP_CODEC_DEV_OK
+               ? ESP_OK
+               : ESP_FAIL;
+}
+#endif
+
 esp_err_t muse_audio_read(int16_t *mono, size_t frames)
 {
+#if CONFIG_MUSE_AUDIO_AFE
+    /* Dual-mic mix is the path AFE replaces. A single slot or a codec-less
+     * mic stays on the high-pass. A failed start keeps that path until the
+     * codecs are powered off, which clears the failure. */
+    bool dual = !muse_board->mic_init && s_mic && muse_board->mic_slot < 0;
+    if (dual && (muse_afe_running() || muse_afe_start() == ESP_OK)) {
+        return muse_afe_read(mono, frames);
+    }
+#endif
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         /* A mic without a codec: its gain applies in float, ahead of the
@@ -428,18 +480,50 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
     /* Speaker off still plays silence at the same pace, so captions timed to
      * the audio scroll as if it were heard. */
     bool mute = !muse_settings_speaker_on();
+#if CONFIG_MUSE_AUDIO_AFE
+    bool afe_held = muse_afe_running();
+    if (afe_held) {
+        muse_afe_hold(true);
+    }
+#endif
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
+        bool audible = false;
         for (size_t i = 0; i < n; i++) {
             s_out_stereo[2 * i] = mute ? 0 : mono[i];
             s_out_stereo[2 * i + 1] = mute ? 0 : mono[i];
+            if (!mute && mono[i]) {
+                audible = true;
+            }
         }
+        /* First samples of a reply, and again after a quiet gap: the amp pin
+         * and the codec registers get logged while this chunk is still here. */
+        int64_t now = esp_timer_get_time();
+        bool gap = s_last_write && now - s_last_write > 500000;
+        if (audible && s_spk && muse_board->speaker_probe && (!s_heard || gap)) {
+            s_heard = true;
+            muse_board->speaker_probe(s_spk, "play");
+        }
+        if (!audible) {
+            s_heard = false;
+        }
+        s_last_write = now;
         if (esp_codec_dev_write(s_spk, s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+#if CONFIG_MUSE_AUDIO_AFE
+            if (afe_held) {
+                muse_afe_hold(false);
+            }
+#endif
             return ESP_FAIL;
         }
         mono += n;
         frames -= n;
     }
+#if CONFIG_MUSE_AUDIO_AFE
+    if (afe_held) {
+        muse_afe_hold(false);
+    }
+#endif
     return ESP_OK;
 }
 

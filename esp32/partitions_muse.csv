@@ -25,3 +25,9 @@ ota_0,     app,  ota_0,   0x20000,  4M,
 ota_1,     app,  ota_1,   0x420000, 4M,
 prod_data, data, 0x40,    0x820000, 0x1000,
 prod_bak,  data, 0x41,    0x821000, 0x1000,
+# esp-sr nsnet2 for CONFIG_MUSE_AUDIO_AFE. Appended so every offset above stays
+# put. prod_bak ends at 0x822000; 0x830000 is the next aligned hole. The packed
+# model is 332 KB; 384 KB leaves a little room. 32 MB flash on the 1.75C.
+# Boards on partitions_muse_8mb.csv do not get this row; AFE init falls back
+# if the partition is absent.
+model,     data, spiffs,  0x830000, 384K,

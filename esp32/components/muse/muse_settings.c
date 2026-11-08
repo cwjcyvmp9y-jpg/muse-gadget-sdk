@@ -50,7 +50,7 @@ static struct {
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
-    .mic_gain = 30,
+    .mic_gain = 24,
     .brightness = 100,
     .sleep_s = 120,
     .text_size = MUSE_TEXT_MEDIUM,

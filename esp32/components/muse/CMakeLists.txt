@@ -47,7 +47,7 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "muse_ui.c" "muse_menu.c" "muse_settings_ui.c" "muse_keypad.c" "muse_lv_mem.c")
     endif()
     if(CONFIG_MUSE_HATCH)
-        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp")
+        list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_volc_tts.c")
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
         if(CONFIG_MUSE_REALTIME_VOICE)
             list(APPEND srcs "muse_voice_call.cpp" "muse_voice_call_core.c")
@@ -184,16 +184,25 @@ if(CONFIG_MUSE_ENABLED)
 elseif(CONFIG_HOMEHUB_VOICE)
     # The Voice PE board uses just the Hatch voice session; the project's main/
     # voice_muse_chat.c stands in for the Muse settings, Wi-Fi and Link hooks.
-    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_chat_text.c" "muse_text.c")
+    list(APPEND srcs "muse_chat.c" "muse_account_api.c" "muse_chat_session.cpp" "muse_volc_tts.c" "muse_chat_text.c" "muse_text.c")
     list(APPEND embed "test_reply.mp3")
     if(CONFIG_MUSE_REALTIME_VOICE)
         list(APPEND srcs "muse_voice_call.cpp" "muse_voice_call_core.c")
     endif()
 endif()
 
+# Shadowsocks 2022 bridge. Always built: a gitignored ss_proxy_secret.h can
+# turn it on without a Kconfig change. Blake3 stays on the portable path.
+list(APPEND srcs "muse_proxy.c" "muse_ss2022.c"
+     "third_party/blake3/blake3.c" "third_party/blake3/blake3_dispatch.c"
+     "third_party/blake3/blake3_portable.c")
+if(CONFIG_MUSE_AUDIO_AFE)
+    list(APPEND srcs "muse_afe.c")
+endif()
+
 set(muse_priv_requires
     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash esp_pm esp_event esp_netif
-    bt esp-tls mbedtls esp_app_format esp_http_client
+    bt esp-tls mbedtls esp_app_format esp_http_client lwip
     noise_core minimp3 muse_vstream tinyh264 libvpx_vp8
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
     esp_driver_pcnt efuse
@@ -215,6 +224,11 @@ idf_component_register(
     REQUIRES esp_driver_gpio esp_driver_i2c
     PRIV_REQUIRES ${muse_priv_requires}
 )
+
+# main/volc_tts_secret.h and main/ss_proxy_secret.h are gitignored and may
+# appear after configure. __has_include picks them up on the next compile.
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_SOURCE_DIR}/main")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
 
 if(CONFIG_MUSE_UI_FREEINK)
     # FreeInk's board profile, for the panel and its pins. PUBLIC: FreeInk's
