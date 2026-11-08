@@ -32,6 +32,9 @@
 #include "muse_board.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
+#if CONFIG_MUSE_AUDIO_AFE
+#include "muse_afe.h"
+#endif
 
 static const char *TAG = "muse_audio";
 
@@ -245,6 +248,9 @@ void muse_audio_power(bool on)
             codec_power(false);
         }
     } else {
+#if CONFIG_MUSE_AUDIO_AFE
+        muse_afe_stop();
+#endif
         if (muse_board->audio_power) {
             muse_board->audio_power(false);
         }
@@ -416,8 +422,29 @@ void muse_audio_loopback_test(int volume)
     muse_audio_set_volume(muse_settings_volume());
 }
 
+#if CONFIG_MUSE_AUDIO_AFE
+esp_err_t muse_audio_read_interleaved(int16_t *interleaved, size_t frames)
+{
+    if (!interleaved || !frames || !s_open || !s_mic) {
+        return ESP_FAIL;
+    }
+    return esp_codec_dev_read(s_mic, interleaved, frames * CHANNELS * sizeof(int16_t)) == ESP_CODEC_DEV_OK
+               ? ESP_OK
+               : ESP_FAIL;
+}
+#endif
+
 esp_err_t muse_audio_read(int16_t *mono, size_t frames)
 {
+#if CONFIG_MUSE_AUDIO_AFE
+    /* Dual-mic mix is the path AFE replaces. A single slot or a codec-less
+     * mic stays on the high-pass. A failed start keeps that path until the
+     * codecs are powered off, which clears the failure. */
+    bool dual = !muse_board->mic_init && s_mic && muse_board->mic_slot < 0;
+    if (dual && (muse_afe_running() || muse_afe_start() == ESP_OK)) {
+        return muse_afe_read(mono, frames);
+    }
+#endif
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         /* A mic without a codec: its gain applies in float, ahead of the
@@ -453,6 +480,12 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
     /* Speaker off still plays silence at the same pace, so captions timed to
      * the audio scroll as if it were heard. */
     bool mute = !muse_settings_speaker_on();
+#if CONFIG_MUSE_AUDIO_AFE
+    bool afe_held = muse_afe_running();
+    if (afe_held) {
+        muse_afe_hold(true);
+    }
+#endif
     while (frames) {
         size_t n = frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : frames;
         bool audible = false;
@@ -476,11 +509,21 @@ esp_err_t muse_audio_write(const int16_t *mono, size_t frames)
         }
         s_last_write = now;
         if (esp_codec_dev_write(s_spk, s_out_stereo, n * CHANNELS * sizeof(int16_t)) != ESP_CODEC_DEV_OK) {
+#if CONFIG_MUSE_AUDIO_AFE
+            if (afe_held) {
+                muse_afe_hold(false);
+            }
+#endif
             return ESP_FAIL;
         }
         mono += n;
         frames -= n;
     }
+#if CONFIG_MUSE_AUDIO_AFE
+    if (afe_held) {
+        muse_afe_hold(false);
+    }
+#endif
     return ESP_OK;
 }
 

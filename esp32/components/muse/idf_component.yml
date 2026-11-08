@@ -16,6 +16,12 @@ dependencies:
   idf:
     version: ">=5.5"
   espressif/cjson: "~1.7"
+  # Speech front-end (NS + dual-mic SE). 2.4.6 is the release that builds on
+  # ESP-IDF v6.0. Only fetched when the AFE option is on.
+  espressif/esp-sr:
+    version: "2.4.6"
+    rules:
+      - if: "$CONFIG{MUSE_AUDIO_AFE} == True"
   # Video over Wi-Fi announces itself with it (muse_video_wifi.c).
   espressif/mdns:
     version: "^1.8"

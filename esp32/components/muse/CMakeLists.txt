@@ -196,6 +196,9 @@ endif()
 list(APPEND srcs "muse_proxy.c" "muse_ss2022.c"
      "third_party/blake3/blake3.c" "third_party/blake3/blake3_dispatch.c"
      "third_party/blake3/blake3_portable.c")
+if(CONFIG_MUSE_AUDIO_AFE)
+    list(APPEND srcs "muse_afe.c")
+endif()
 
 set(muse_priv_requires
     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash esp_pm esp_event esp_netif

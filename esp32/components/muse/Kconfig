@@ -387,6 +387,18 @@ menu "Muse"
         help
             Used only with the I2S mic option; -1 leaves it unconnected.
 
+    config MUSE_AUDIO_AFE
+        bool "esp-sr noise suppression on the microphone"
+        depends on MUSE_ENABLED && SPIRAM && IDF_TARGET_ESP32S3
+        default n
+        help
+            Replace the mic mix and 80 Hz high-pass in muse_audio_read()
+            with esp-sr's AFE (AFE_TYPE_SR): dual-mic "MM", noise suppression
+            and speech enhancement, conservative AGC, no AEC, no VAD and no
+            WakeNet. Off keeps the old path. Init failure (missing model or
+            no memory) falls back to that path and logs it. The 1.75C turns
+            this on. Keep the feed task and model buffers in PSRAM.
+
     config MUSE_STATIC_BUFFERS_IN_PSRAM
         bool "Keep the avatar's and audio's static buffers in PSRAM"
         depends on MUSE_ENABLED && SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
