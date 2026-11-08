@@ -158,6 +158,11 @@ typedef struct {
      * and gain setters until they open again, and reapplies the settings
      * then. NULL: always powered. */
     void (*codec_power)(bool on);
+    /* After the speaker is open and the volume and amp are set, and again
+     * at the start of audible playback. NULL: none. */
+    void (*speaker_probe)(esp_codec_dev_handle_t spk, const char *when);
+    /* Once, after muse_audio_init logs "audio ready". NULL: none. */
+    void (*boot_tone)(void);
 
     /* Called every 10 ms from the input task (50 ms while the display is
      * paused, unless wait_buttons is set); returns MUSE_BTN_* edges. */

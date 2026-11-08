@@ -211,6 +211,22 @@ static void spend(esp_http_client_handle_t c, int64_t us) {
     }
 }
 
+esp_err_t muse_proxy_http_url(const char *url, char *out, size_t cap, char *origin, size_t origin_cap) {
+    snprintf(out, cap, "%s", url);
+    if (origin && origin_cap) origin[0] = '\0';
+    return ESP_OK;
+}
+
+esp_err_t esp_http_client_set_header(esp_http_client_handle_t c, const char *key, const char *value) {
+    (void)c; (void)key; (void)value;
+    return ESP_OK;
+}
+
+esp_err_t esp_http_client_set_url(esp_http_client_handle_t c, const char *url) {
+    snprintf(c->url, sizeof(c->url), "%s", url);
+    return ESP_OK;
+}
+
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config) {
     esp_http_client_handle_t c = calloc(1, sizeof(*c));
     CHECK(c, "calloc");

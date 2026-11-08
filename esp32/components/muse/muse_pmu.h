@@ -40,8 +40,13 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs);
 
 /* Turns off every rail but these, by their enable bits: dcdc has DCDC1-5 in
  * bits 0-4; ldo has ALDO1-4, BLDO1-2, CPUSLDO and DLDO1 in bits 0-7 and DLDO2
- * in bit 8. Turns nothing on. */
+ * in bit 8. Turns nothing on, and does not change a rail's voltage. */
 esp_err_t muse_pmu_keep_rails(uint8_t dcdc, uint16_t ldo);
+
+/* DCDC1 and ALDO1 to 3.3 V, and on. The 1.75(C) codecs' analog supply is
+ * ALDO1; keep_rails() leaves it off, and at the PMU's default voltage, if
+ * nothing has turned it on yet. */
+esp_err_t muse_pmu_set_dcdc1_aldo1_3v3(void);
 
 /* Whether holding PWR powers the board off: past the 10 s hold-off, and after
  * 16 s where the PMU has that on. Boards that talk on PWR turn it on
